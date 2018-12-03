@@ -42,9 +42,14 @@ class Register
   end
 
   def append_entry region, key, item, time=Time.now
+    json = JSON.dump item
+    #STDERR.puts "orc append-entry #{@io.path} #{region} #{key} #{json}"
+
+    raise "region cannot be nil" if region.nil?
+    raise "key cannot be nil" if key.nil?
     @items << item
-    @io.write "add-item\t#{JSON.dump(item)}\n"
-    @io.write "append-entry\t#{region}\t#{key}\t#{time.utc.strftime(DATE_FORMAT)}\t#{hash(JSON.dump(item))}\n"
+    @io.write "add-item\t#{json}\n"
+    @io.write "append-entry\t#{region}\t#{key}\t#{time.utc.strftime(DATE_FORMAT)}\t#{hash(json)}\n"
   end
 
   def close

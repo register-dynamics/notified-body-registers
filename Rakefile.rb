@@ -5,6 +5,8 @@ require_relative 'register'
 
 DIRECTIVE_CODE = /\d+\/\d+(\/[A-Z]+)?/
 
+WHITESPACE_WITH_NBSP = /\s|\u00A0/
+
 RSFs = FileList[
   'legislation.rsf',
   'product.rsf',
@@ -23,14 +25,17 @@ def nando action
   nando_rel_link "index.cfm?fuseaction=#{action}"
 end
 
+def cached href
+  File.join CACHE, "#{Base64.urlsafe_encode64(href, padding: false)}.html"
+end
+
 def page href
-  filename = File.join CACHE, "#{Base64.urlsafe_encode64(href, padding: false)}.html"
+  filename = cached href
   unless File.exist? filename
     rake_output_message "GET #{href}"
     File.write filename, open(href, &:read)
   end
 
-  rake_output_message "#{href} -> #{filename}"
   open(filename, &Nokogiri.method(:HTML))
 end
 
@@ -38,6 +43,12 @@ def parse_legislation_text text
   words, code, name = text.strip.partition(DIRECTIVE_CODE)
   legislation_id = words + code
   [legislation_id, name]
+end
+
+def progress done, total
+  msg = "Progress: #{done}/#{total}"
+  STDERR.write msg
+  STDERR.write "\b" * msg.length
 end
 
 task :default => RSFs
@@ -73,7 +84,26 @@ file 'legislation.rsf' do |t|
   legislation.close
 end
 
-task :read_legislation_pages do
+def find_legislation_page legislation_id
+  legislation_page = page nando_rel_link('index.cfm?fuseaction=notifiedbody.notifiedbodies&num=DNB&text=')
+  dir_id = legislation_page.css('select[name="dir_id"] option').find do |option|
+    text = option.text.strip
+    parsed_legislation_id, _ = parse_legislation_text text
+    legislation_id == parsed_legislation_id
+  end.attribute('value').value
+  "index.cfm?fuseaction=directive.notifiedbody&dir_id=#{dir_id}"
+end
+
+def truncated_string_match? full, maybe_truncated, truncation='...'
+  # downcases sadly necessary, data quality is odd
+  if maybe_truncated.end_with? truncation
+    full.downcase.start_with? maybe_truncated[0...-(truncation.length)].downcase
+  else
+    full.downcase == maybe_truncated.downcase
+  end
+end
+
+file 'body.rsf' do
   products = Register.new 'product.rsf'
   products.init(
     'product',
@@ -81,9 +111,40 @@ task :read_legislation_pages do
     'Products covered by a particular EU product Directive/Regulation.',
     Register::Field.new('product', 'integer', 'The NANDO unique identifier for these products.', 1),
     Register::Field.new('legislation', 'curie', 'The item of EU legislation that covers the products.', 1),
-    Register::Field.new('description', 'string', 'Description of product types covered.', 1)
+    Register::Field.new('description', 'string', 'Description of product types covered.', 1),
+    Register::Field.new('parent', 'curie', 'The NANDO unique identifier for the parent product category, if this product has one.', 1)
   )
   products.custodian = 'Simon Worthington'
+
+  find_product_id = proc do |legislation_id, description, parent|
+    listing_link = nando_rel_link find_legislation_page legislation_id
+    listing_page = page listing_link
+    product_option = listing_page.css('table table select[name="pro_id"] option').find do |option|
+      truncated_string_match? description, option.text.strip
+    end
+    product_option ||= begin
+      parent = products.items.find {|p| p[:product] == parent }
+      listing_page.css('table table select[name="pro_id"] option').find do |option|
+        truncated_string_match? "#{parent[:description]} (#{description})", option.text.strip
+      end
+    end
+    raise "Unable to find product #{description.inspect} [#{parent}] in #{cached listing_link}" if product_option.nil?
+    product_option.attribute('value').value.to_i
+  end
+
+  find_or_add_product = proc do |legislation_id, description, parent|
+    product = products.items.find {|p| p[:description] == description && p[:parent] == (parent.nil? ? nil : "product:#{parent}") && p[:legislation] == "legislation:#{legislation_id}" }
+    if product.nil?
+      product = {
+        product: find_product_id.call(legislation_id, description, parent),
+        legislation: "legislation:#{legislation_id}",
+        description: description,
+        parent: (parent.nil? ? nil : "product:#{parent}")
+      }
+      products.append_entry :user, product[:product], product
+    end
+    product
+  end
 
   procedures = Register.new 'procedure.rsf'
   procedures.init(
@@ -96,6 +157,27 @@ task :read_legislation_pages do
     Register::Field.new('description', 'string', 'Summary of what activity the procedure defines.')
   )
   procedures.custodian = 'Simon Worthington'
+
+  find_procedure_id = proc do |legislation_id, description, annexes|
+    listing_page = page nando_rel_link find_legislation_page legislation_id
+    listing_page.css('table table select[name="prc_anx"] option').find do |option|
+      truncated_string_match? "#{description} / #{annexes}", option.text.strip
+    end.attribute('value').value.to_i
+  end
+
+  find_or_add_procedure = proc do |legislation_id, description, annexes|
+    procedure = procedures.items.find {|p| p[:description] == description && p[:annexes] == annexes && p[:legislation] == "legislation:#{legislation_id}" }
+    if procedure.nil?
+      procedure = {
+        procedure: find_procedure_id.call(legislation_id, description, annexes),
+        legislation: "legislation:#{legislation_id}",
+        description: description.strip,
+        annexes: annexes.strip
+      }
+      procedures.append_entry :user, procedure[:procedure], procedure
+    end
+    procedure
+  end
 
   bodies = Register.new 'body.rsf'
   bodies.init(
@@ -117,51 +199,19 @@ task :read_legislation_pages do
   )
   bodies.custodian = 'Simon Worthington'
 
-  legislation_page = page nando('directive.main')
-  legislation_page.css('#main_content table table tr').each do |legislation_row|
-    link = legislation_row.css('a').first
-    text = link.text.strip
-    href = link.attribute 'href'
-    legislation_id, _ = parse_legislation_text text
-
-    listing_page = page nando_rel_link(href)
-    listing_page.css('table table select[name="pro_id"] option').each do |option|
-      next if option.text.strip == 'ALL'
-      id = option.attribute('value').value.to_i
-
-      products.append_entry :user, id, {
-        product: id,
-        legislation: "legislation:#{legislation_id}",
-        description: option.text.strip
-      }
-    end
-
-    listing_page.css('table table select[name="prc_anx"] option').each do |option|
-      next if option.text.strip == 'ALL'
-      id = option.attribute('value').value.to_i
-      description, annexes = option.text.split('/')
-      annexes ||= ''
-
-      procedures.append_entry :user, id, {
-        procedure: id,
-        legislation: "legislation:#{legislation_id}",
-        description: description.strip,
-        annexes: annexes.strip
-      }
-    end
-  end
-
   bodies_nav_page = page nando('notifiedbody.main')
   bodies_nav_page.css('#main_content table table td img + a.list').each do |bodies_page_link|
     bodies_page = page nando_rel_link(bodies_page_link.attribute('href').value)
-    bodies_page.css('#main_content table tr:nth-child(6) table tr:not(:first-child)').each do |body_row|
+    bodies_page.css('#main_content table tr:nth-child(6) table tr:not(:first-child)').each_with_index do |body_row|
       body_info = {}
       body_type, _ = body_row.at_css('td:first-child').text.split(' ')
       body_info[:type] = "body-type:#{body_type.gsub(/[^A-Z]/, '')}" #to handle nbsp
 
       href = body_row.at_css('a').attribute('href').value
       query_params = URI.parse(href).query.split('&').map {|s| s.split('=')}.to_h
-      body_info[:body] = query_params['refe_cd']
+      body_info[:body] = URI.decode(query_params['refe_cd'])
+
+      # First look through the body page and pull out the contact information
       body_page = page nando_rel_link(href)
       body_page.at_css('#main_content > table > tr:nth-child(3) > td:nth-child(2)').children.each do |c|
         case c
@@ -177,42 +227,49 @@ task :read_legislation_pages do
             next
           elsif c.text.strip != ''
             # Address line
-            body_info[:address] = (body_info[:address] || '') + "\n" + c.text.strip
+            body_info[:address] = (body_info[:address] || '') + c.text.strip + "\n"
           end
         end
       end
 
+      # Now look at all the legislations this body is notified for
       body_page.css('#main_content table table tr:not(:first-child)').each do |legislation_row|
-        href = legislation_row.at_css('td:nth-child(2) a').attribute('href').value
+        href = legislation_row.at_xpath('.//a[text() = "HTML"]').attribute('href').value
         legislation_id, _ = parse_legislation_text legislation_row.at_css('td:nth-child(1)').text
         next if legislation_id == 'Regulation (EU) No 305/2011' # skip construction products for now
 
         legislation_page = page nando_rel_link(href)
+        last_top_product = nil
         legislation_page.at_css('#main_content table table table tr:not(:first-child) td:first-child').children.each do |c|
           next unless c.is_a? Nokogiri::XML::Text
-          product = products.items.find {|p| p[:description] == c.text.strip }
-          if product.nil?
-            STDERR.puts "Product not found? #{c.text.strip}"
-          else
-            body_info[:products] = (body_info[:products] || "") + "product:#{product[:product]};"
+          description = c.text.gsub(/^(#{WHITESPACE_WITH_NBSP})+/, '').gsub(/(#{WHITESPACE_WITH_NBSP})+$/, '')
+          next unless description != ''
+          subproduct = description.start_with?('-')
+          description = subproduct ? description[2..-1] : description
+          parent = subproduct ? last_top_product : nil
+          begin
+            product = find_or_add_product.call legislation_id, description, parent
+          rescue Exception => e
+            STDERR.puts e
+            next
           end
+          body_info[:products] = (body_info[:products] || "") + "product:#{product[:product]};"
+          last_top_product = product[:product] unless subproduct
         end
 
         procedure_cells = legislation_page.at_css('#main_content table table table tr:not(:first-child) td:nth-child(2)').children
         annex_cells = legislation_page.at_css('#main_content table table table tr:not(:first-child) td:nth-child(3)').children
         procedure_cells.zip(annex_cells).each do |procedure_description, annex|
-          raise unless annex.class == procedure_description.class
+          raise 'Looks like procedures and annexes are not 1-1 after all' unless annex.class == procedure_description.class
           next unless procedure_description.is_a? Nokogiri::XML::Text
-          procedure = procedures.items.find {|p| p[:description] == procedure_description.text.strip && p[:annexes] == annex.text.strip }
-          if procedure.nil?
-            STDERR.puts "Procedure not found? #{procedure_description.text.strip} / #{annex.text.strip}"
-          else
-            body_info[:procedures] = (body_info[:procedures] || "") + "procedure:#{procedure[:procedure]};"
-          end
+          next unless procedure_description.text.strip != ''
+          procedure = find_or_add_procedure.call legislation_id, procedure_description.text.strip, annex.text.strip
+          body_info[:procedures] = (body_info[:procedures] || "") + "procedure:#{procedure[:procedure]};"
         end
       end
 
-      bodies.append_entry :user, body_info[:id], body_info
+      bodies.append_entry :user, body_info[:body], body_info
+      progress bodies.items.size, 2900
     end
   end
 
@@ -221,9 +278,8 @@ task :read_legislation_pages do
   bodies.close
 end
 
-file 'product.rsf' => :read_legislation_pages
-file 'procedure.rsf' => :read_legislation_pages
-file 'body.rsf' => :read_legislation_pages
+file 'product.rsf' => 'body.rsf'
+file 'procedure.rsf' => 'body.rsf'
 
 file 'body-type.rsf' do |t|
   body_types = Register.new t.name
@@ -242,6 +298,7 @@ file 'body-type.rsf' do |t|
   body_types.append_entry :user, "TAB",  {'body-type': "TAB",  name: "Technical Assessment Body", definition: "An organisation that has been designated by a Member State as being entrusted with the establishment of draft European Assessment Documents and the issuing of European Technical Assessments in accordance with the Construction Products Regulation (EU) No 305/ 2011 (CPR)."}
   body_types.append_entry :user, "UI",   {'body-type': "UI",   name: "User Inspectorate", definition: "A conformity assessment body notified to carry out the tasks set out in Article 16 of Directive 2014/68/EU on Pressure Equipment (PED)."}
   body_types.append_entry :user, "RTPO", {'body-type': "RTPO", name: "Recognised Third Party Organisation", definition: "A conformity assessment body notified to carry out the tasks set out in Article 20 of Directive 2014/68/EU on Pressure Equipment (PED)."}
+  body_types.close
 end
 
 file STORE => RSFs do |t|
