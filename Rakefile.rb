@@ -68,7 +68,7 @@ file 'legislation.rsf' do |t|
   legislation = Register.new t.name
   legislation.init(
     'legislation',
-    'european-commission',
+    'European-Commission-NANDO',
     'EU product harmonisation legislation - can be in the form of a Directive, a Regulation or a Decision.',
     Register::Field.new('legislation', 'string', 'Unique code or text that identifies the legislation.', 1),
     Register::Field.new('name', 'string', 'Summary of types of products that the legislation covers.', 1))
@@ -107,7 +107,7 @@ file 'body.rsf' do
   products = Register.new 'product.rsf'
   products.init(
     'product',
-    'european-commission',
+    'European-Commission-NANDO',
     'Products covered by a particular EU product Directive/Regulation.',
     Register::Field.new('product', 'integer', 'The NANDO unique identifier for these products.', 1),
     Register::Field.new('legislation', 'curie', 'The item of EU legislation that covers the products.', 1),
@@ -149,7 +149,7 @@ file 'body.rsf' do
   procedures = Register.new 'procedure.rsf'
   procedures.init(
     'procedure',
-    'european-commission',
+    'European-Commission-NANDO',
     'Conformity assessment procedure as set out in Annex II of Decision 758/2008/EC, and in the relevant EU product legislation',
     Register::Field.new('procedure', 'integer', 'The NANDO unique identifier for this procedure.'),
     Register::Field.new('legislation', 'curie', 'The item of EU legislation that includes the procedure.'),
@@ -182,8 +182,8 @@ file 'body.rsf' do
   bodies = Register.new 'body.rsf'
   bodies.init(
     'body',
-    'european-commission',
-    '',
+    'European-Commission-NANDO',
+    'Organisations that, having fulfilled the relevant requirements, are designated to carry out conformity assessment according to specific legislation.',
     Register::Field.new('body', 'string', 'The NANDO unique identifier for this body.'),
     Register::Field.new('type', 'curie', 'The unique code for the type that this body is.'),
     Register::Field.new('notified-body-number', 'integer', 'The unique number assigned to this body if it has notified.'),
@@ -285,7 +285,7 @@ file 'body-type.rsf' do |t|
   body_types = Register.new t.name
   body_types.init(
     'body-type',
-    'european-commission',
+    'European-Commission-NANDO',
     'Types of body defined by NANDO.',
     Register::Field.new('body-type', 'string', 'Unique abbreviation representing the type of the body.'),
     Register::Field.new('name', 'string', 'Full name of the body type.'),
