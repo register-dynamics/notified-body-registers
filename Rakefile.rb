@@ -2,6 +2,7 @@ require 'open-uri'
 require 'nokogiri'
 require 'base64'
 require_relative 'register'
+require_relative 'orc'
 
 DIRECTIVE_CODE = /\d+\/\d+(\/[A-Z]+)?/
 
@@ -10,7 +11,7 @@ WHITESPACE_WITH_NBSP = /\s|\u00A0/
 RSFs = FileList[
   'legislation.rsf',
   'product.rsf',
-  'procedure.rsf',
+  'annex.rsf',
   'body-type.rsf',
   'body.rsf'
 ]
@@ -65,10 +66,11 @@ task :mrproper => :clean do
 end
 
 file 'legislation.rsf' do |t|
-  legislation = Register.new t.name
+  orc = Orc.new STORE
+  legislation = Register.new orc
   legislation.init(
     'legislation',
-    'European-Commission-NANDO',
+    'European-Commission',
     'EU product harmonisation legislation - can be in the form of a Directive, a Regulation or a Decision.',
     Register::Field.new('legislation', 'string', 'Unique code or text that identifies the legislation.', 1),
     Register::Field.new('name', 'string', 'Summary of types of products that the legislation covers.', 1))
@@ -81,7 +83,9 @@ file 'legislation.rsf' do |t|
 
     legislation.append_entry :user, legislation_id, {legislation: legislation_id, name: name.strip}
   end
-  legislation.close
+  legislation.finish!
+  orc.close
+  legislation.to_rsf t.name
 end
 
 def find_legislation_page legislation_id
@@ -104,10 +108,11 @@ def truncated_string_match? full, maybe_truncated, truncation='...'
 end
 
 file 'body.rsf' do
-  products = Register.new 'product.rsf'
+  orc = Orc.new STORE
+  products = MultiItemRegister.new orc
   products.init(
     'product',
-    'European-Commission-NANDO',
+    'European-Commission',
     'Products covered by a particular EU product Directive/Regulation.',
     Register::Field.new('product', 'integer', 'The NANDO unique identifier for these products.', 1),
     Register::Field.new('legislation', 'curie', 'The item of EU legislation that covers the products.', 1),
@@ -115,6 +120,7 @@ file 'body.rsf' do
     Register::Field.new('parent', 'curie', 'The NANDO unique identifier for the parent product category, if this product has one.', 1)
   )
   products.custodian = 'Simon Worthington'
+  products.add_index :description
 
   find_product_id = proc do |legislation_id, description, parent|
     listing_link = nando_rel_link find_legislation_page legislation_id
@@ -123,7 +129,7 @@ file 'body.rsf' do
       truncated_string_match? description, option.text.strip
     end
     product_option ||= begin
-      parent = products.items.find {|p| p[:product] == parent }
+      parent = products.find(:product, parent).first
       listing_page.css('table table select[name="pro_id"] option').find do |option|
         truncated_string_match? "#{parent[:description]} (#{description})", option.text.strip
       end
@@ -133,7 +139,8 @@ file 'body.rsf' do
   end
 
   find_or_add_product = proc do |legislation_id, description, parent|
-    product = products.items.find {|p| p[:description] == description && p[:parent] == (parent.nil? ? nil : "product:#{parent}") && p[:legislation] == "legislation:#{legislation_id}" }
+    matching_products = products.find :description, description
+    product = matching_products.find {|p| p[:description] == description && p[:parent] == (parent.nil? ? nil : "product:#{parent}") && p[:legislation] == "legislation:#{legislation_id}" }
     if product.nil?
       product = {
         product: find_product_id.call(legislation_id, description, parent),
@@ -146,43 +153,49 @@ file 'body.rsf' do
     product
   end
 
-  procedures = Register.new 'procedure.rsf'
-  procedures.init(
-    'procedure',
-    'European-Commission-NANDO',
-    'Conformity assessment procedure as set out in Annex II of Decision 758/2008/EC, and in the relevant EU product legislation',
-    Register::Field.new('procedure', 'integer', 'The NANDO unique identifier for this procedure.'),
-    Register::Field.new('legislation', 'curie', 'The item of EU legislation that includes the procedure.'),
-    Register::Field.new('annexes', 'string', 'Annex or Article of the Directive/Regulation which is the source of the procedure.'),
-    Register::Field.new('description', 'string', 'Summary of what activity the procedure defines.')
+  annexes = MultiItemRegister.new orc
+  annexes.init(
+    'annex',
+    'European-Commission',
+    'An Annex or Article of a peice of Legislation that defines a conformity assessment procedure, as set out in Annex II of Decision 758/2008/EC and in the relevant EU product legislation',
+    Register::Field.new('annex', 'string', 'The NANDO unique identifier for this annex.', 1),
+    Register::Field.new('name', 'string', 'Human-readable name of the annex.', 1),
+    Register::Field.new('legislation', 'curie', 'The item of EU legislation that includes the procedure.', 1),
+    Register::Field.new('procedures', 'string', 'Summaries of the procedures that the annex defines.', 'n'),
   )
-  procedures.custodian = 'Simon Worthington'
+  annexes.custodian = 'Simon Worthington'
+  annexes.add_index :name
 
-  find_procedure_id = proc do |legislation_id, description, annexes|
-    listing_page = page nando_rel_link find_legislation_page legislation_id
-    listing_page.css('table table select[name="prc_anx"] option').find do |option|
-      truncated_string_match? "#{description} / #{annexes}", option.text.strip
-    end.attribute('value').value.to_i
+  find_annex_id = proc do |legislation_id, name, procedures|
+    listing_link = nando_rel_link find_legislation_page legislation_id
+    listing_page = page listing_link
+    value = listing_page.css('table table select[name="prc_anx"] option').find do |option|
+      truncated_string_match? "#{procedures.first} / #{name}", option.text.strip
+    end.attribute('value').value
+    "#{legislation_id}:#{value}"
   end
 
-  find_or_add_procedure = proc do |legislation_id, description, annexes|
-    procedure = procedures.items.find {|p| p[:description] == description && p[:annexes] == annexes && p[:legislation] == "legislation:#{legislation_id}" }
-    if procedure.nil?
-      procedure = {
-        procedure: find_procedure_id.call(legislation_id, description, annexes),
+  find_or_add_annex = proc do |legislation_id, name, procedures|
+    matching_annexes = annexes.find :name, name
+    annex = matching_annexes.find {|p| p[:name] == name && p[:legislation] == "legislation:#{legislation_id}" }
+    if annex.nil?
+      annex = {
+        annex: find_annex_id.call(legislation_id, name, procedures),
         legislation: "legislation:#{legislation_id}",
-        description: description.strip,
-        annexes: annexes.strip
+        name: name.strip,
+        procedures: procedures
       }
-      procedures.append_entry :user, procedure[:procedure], procedure
+      annexes.append_entry :user, annex[:annex], annex
+    else
+      annex[:procedures] = annex[:procedures] | procedures
     end
-    procedure
+    annex
   end
 
-  bodies = Register.new 'body.rsf'
+  bodies = Register.new orc
   bodies.init(
     'body',
-    'European-Commission-NANDO',
+    'European-Commission',
     'Organisations that, having fulfilled the relevant requirements, are designated to carry out conformity assessment according to specific legislation.',
     Register::Field.new('body', 'string', 'The NANDO unique identifier for this body.'),
     Register::Field.new('type', 'curie', 'The unique code for the type that this body is.'),
@@ -194,8 +207,8 @@ file 'body.rsf' do
     Register::Field.new('fax', 'string', 'A phone number on which the body can receive faxes.'),
     Register::Field.new('email', 'string', 'An e-mail address at which the body can receive mail.'),
     Register::Field.new('website', 'string', 'URL of a website describing the body.'), #TODO type
-    Register::Field.new('products', 'string', 'Product types the body is accredited to handle.'), #TODO desc
-    Register::Field.new('procedures', 'string', 'Procedures the body is accredited to carry out.') #TODO desc
+    Register::Field.new('products', 'curie', 'Product types the body is accredited to handle.', 'n'), #TODO desc
+    Register::Field.new('annexes', 'curie', 'Annexes containing the procedures that the body is accredited to carry out.', 'n') #TODO desc
   )
   bodies.custodian = 'Simon Worthington'
 
@@ -253,18 +266,23 @@ file 'body.rsf' do
             STDERR.puts e
             next
           end
-          body_info[:products] = (body_info[:products] || "") + "product:#{product[:product]};"
+          body_info[:products] = (body_info[:products] || []).push "product:#{product[:product]}"
           last_top_product = product[:product] unless subproduct
         end
 
         procedure_cells = legislation_page.at_css('#main_content table table table tr:not(:first-child) td:nth-child(2)').children
         annex_cells = legislation_page.at_css('#main_content table table table tr:not(:first-child) td:nth-child(3)').children
-        procedure_cells.zip(annex_cells).each do |procedure_description, annex|
+        found_annexes = procedure_cells.zip(annex_cells).reduce({}) do |hash, (procedure_description, annex)|
           raise 'Looks like procedures and annexes are not 1-1 after all' unless annex.class == procedure_description.class
-          next unless procedure_description.is_a? Nokogiri::XML::Text
-          next unless procedure_description.text.strip != ''
-          procedure = find_or_add_procedure.call legislation_id, procedure_description.text.strip, annex.text.strip
-          body_info[:procedures] = (body_info[:procedures] || "") + "procedure:#{procedure[:procedure]};"
+          next hash unless annex.is_a? Nokogiri::XML::Text
+          next hash unless annex.text.strip != ''
+          hash[annex.text.strip] = (hash[annex.text.strip] || []).push procedure_description.text.strip
+          hash
+        end
+
+        body_info[:annexes] = found_annexes.map do |annex, procedures|
+          annex = find_or_add_annex.call legislation_id, annex, procedures
+          "annex:#{annex[:annex]}"
         end
       end
 
@@ -273,19 +291,32 @@ file 'body.rsf' do
     end
   end
 
-  products.close
-  procedures.close
-  bodies.close
+  [products, annexes, bodies].each do |register|
+    primary_index = register.indexes[register.name.to_sym]
+    multi_keys = primary_index.keys.select {|k| primary_index[k].size > 1 }
+    multi_keys.each do |key|
+      warn "Register '#{register.name}' contains multiple items for key '#{key}'"
+    end
+  end
+
+  products.finish!
+  annexes.finish!
+  bodies.finish!
+  orc.close
+  products.to_rsf 'products.rsf'
+  annexes.to_rsf 'annexes.rsf'
+  bodies.to_rsf 'bodies.rsf'
 end
 
 file 'product.rsf' => 'body.rsf'
-file 'procedure.rsf' => 'body.rsf'
+file 'annex.rsf' => 'body.rsf'
 
 file 'body-type.rsf' do |t|
-  body_types = Register.new t.name
+  orc = Orc.new STORE
+  body_types = Register.new orc
   body_types.init(
     'body-type',
-    'European-Commission-NANDO',
+    'European-Commission',
     'Types of body defined by NANDO.',
     Register::Field.new('body-type', 'string', 'Unique abbreviation representing the type of the body.'),
     Register::Field.new('name', 'string', 'Full name of the body type.'),
@@ -298,11 +329,10 @@ file 'body-type.rsf' do |t|
   body_types.append_entry :user, "TAB",  {'body-type': "TAB",  name: "Technical Assessment Body", definition: "An organisation that has been designated by a Member State as being entrusted with the establishment of draft European Assessment Documents and the issuing of European Technical Assessments in accordance with the Construction Products Regulation (EU) No 305/ 2011 (CPR)."}
   body_types.append_entry :user, "UI",   {'body-type': "UI",   name: "User Inspectorate", definition: "A conformity assessment body notified to carry out the tasks set out in Article 16 of Directive 2014/68/EU on Pressure Equipment (PED)."}
   body_types.append_entry :user, "RTPO", {'body-type': "RTPO", name: "Recognised Third Party Organisation", definition: "A conformity assessment body notified to carry out the tasks set out in Article 20 of Directive 2014/68/EU on Pressure Equipment (PED)."}
-  body_types.close
+
+  body_types.finish!
+  orc.close
+  body_types.to_rsf t.name
 end
 
-file STORE => RSFs do |t|
-  RSFs.each do |rsf|
-    sh ["orc", "-S", t.name, "digest", rsf].join(" ")
-  end
-end
+file STORE => RSFs
